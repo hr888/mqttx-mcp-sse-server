@@ -3,20 +3,13 @@ const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
 const mqtt = require("mqtt");
 
-// 配置从环境变量读取
+// 配置从环境变量读取（不再包含个人敏感信息）
 const config = {
-  bemfaServer: process.env.BEMFA_SERVER || "bemfa.com",
-  bemfaPort: parseInt(process.env.BEMFA_PORT) || 9501,
-  defaultClientId: process.env.DEFAULT_CLIENT_ID || "1027eaa277d6457fa609c8286749e828",
-  defaultTopic: process.env.DEFAULT_TOPIC || "MasterLight002",
   serverPort: parseInt(process.env.SERVER_PORT) || 4000
 };
 
 console.log("=== Bemfa MCP Server Starting ===");
 console.log("Config:", {
-  bemfaServer: config.bemfaServer,
-  bemfaPort: config.bemfaPort,
-  defaultTopic: config.defaultTopic,
   serverPort: config.serverPort
 });
 
@@ -26,7 +19,11 @@ class Logger {
     const timestamp = new Date().toISOString();
     let logMessage = `[INFO] [${timestamp}] [${context}] ${message}`;
     if (data) {
-      logMessage += ` ${JSON.stringify(data)}`;
+      // 过滤敏感信息
+      const safeData = { ...data };
+      if (safeData.clientId) safeData.clientId = "***" + safeData.clientId.slice(-4);
+      if (safeData.password) safeData.password = "***";
+      logMessage += ` ${JSON.stringify(safeData)}`;
     }
     console.log(logMessage);
   }
@@ -58,7 +55,8 @@ const SessionManager = {
     this.sessions.set(sessionId, { 
       sseRes: res, 
       mqttClient: null,
-      connected: false
+      connected: false,
+      config: null // 每个会话独立的配置
     });
     Logger.info("SessionManager", `New session created`, { sessionId });
     return sessionId;
@@ -80,16 +78,56 @@ const SessionManager = {
 
 // MQTT Handler
 const MQTTHandler = {
-  async connect(session, args) {
+  async configure(session, args) {
     const sessionId = [...SessionManager.sessions].find(([id, s]) => s === session)?.[0];
     
-    // 使用配置的默认值或传入参数
-    const host = args.host || config.bemfaServer;
-    const port = args.port || config.bemfaPort;
-    const clientId = args.clientId || config.defaultClientId;
-    const topic = args.topic || config.defaultTopic;
+    // 验证必需的配置参数
+    const required = ['clientId', 'topic'];
+    const missing = required.filter(field => !args[field]);
     
-    Logger.info("MQTT", `Connecting to Bemfa cloud`, { host, port, clientId, topic });
+    if (missing.length > 0) {
+      throw new Error(`缺少必需的配置参数: ${missing.join(', ')}`);
+    }
+    
+    // 保存会话配置
+    session.config = {
+      host: args.host || "bemfa.com",
+      port: args.port || 9501,
+      clientId: args.clientId,
+      topic: args.topic,
+      username: args.username || "",
+      password: args.password || ""
+    };
+    
+    Logger.info("MQTT", `Configuration saved`, { 
+      sessionId,
+      host: session.config.host,
+      port: session.config.port,
+      topic: session.config.topic,
+      clientId: "***" + args.clientId.slice(-4) // 日志中隐藏敏感信息
+    });
+    
+    return {
+      type: "text",
+      text: `✅ 配置已保存，请调用 connectBemfa 进行连接`
+    };
+  },
+  
+  async connect(session) {
+    const sessionId = [...SessionManager.sessions].find(([id, s]) => s === session)?.[0];
+    
+    if (!session.config) {
+      throw new Error("❌ 请先调用 configureBemfa 配置连接参数");
+    }
+    
+    const config = session.config;
+    
+    Logger.info("MQTT", `Connecting to Bemfa cloud`, { 
+      sessionId,
+      host: config.host,
+      port: config.port,
+      topic: config.topic
+    });
     
     // 断开之前的连接
     if (session.mqttClient) {
@@ -97,11 +135,19 @@ const MQTTHandler = {
     }
     
     const options = {
-      clientId: clientId,
+      clientId: config.clientId,
       clean: true
     };
     
-    const url = `mqtt://${host}:${port}`;
+    // 添加认证信息（如果提供）
+    if (config.username) {
+      options.username = config.username;
+    }
+    if (config.password) {
+      options.password = config.password;
+    }
+    
+    const url = `mqtt://${config.host}:${config.port}`;
     
     try {
       const client = mqtt.connect(url, options);
@@ -111,14 +157,13 @@ const MQTTHandler = {
           Logger.info("MQTT", `Connected to Bemfa cloud`, { sessionId });
           session.mqttClient = client;
           session.connected = true;
-          session.currentTopic = topic;
           
           // 订阅主题
-          client.subscribe(topic, (err) => {
+          client.subscribe(config.topic, (err) => {
             if (err) {
               Logger.error("MQTT", `Subscribe error`, { error: err.message });
             } else {
-              Logger.info("MQTT", `Subscribed to topic`, { topic });
+              Logger.info("MQTT", `Subscribed to topic`, { topic: config.topic });
             }
           });
           
@@ -139,7 +184,7 @@ const MQTTHandler = {
           
           resolve({
             type: "text",
-            text: `✅ 成功连接到巴法云MQTT服务器，主题: ${topic}`
+            text: `✅ 成功连接到巴法云MQTT服务器，主题: ${config.topic}`
           });
         });
         
@@ -159,8 +204,12 @@ const MQTTHandler = {
       throw new Error("❌ 未连接到MQTT服务器，请先调用connectBemfa");
     }
     
+    if (!session.config) {
+      throw new Error("❌ 配置信息丢失，请重新配置");
+    }
+    
     const command = args.command; // on, off, toggle, status
-    const topic = session.currentTopic || config.defaultTopic;
+    const topic = session.config.topic;
     
     // 命令映射
     const commandMap = {
@@ -211,6 +260,7 @@ const MQTTHandler = {
         } else {
           session.connected = false;
           session.mqttClient = null;
+          // 保留配置信息，便于重新连接
           resolve({
             type: "text",
             text: "✅ 已断开MQTT连接"
@@ -218,6 +268,27 @@ const MQTTHandler = {
         }
       });
     });
+  },
+  
+  async getConfig(session) {
+    if (!session.config) {
+      return {
+        type: "text",
+        text: "❌ 尚未配置巴法云参数"
+      };
+    }
+    
+    // 返回配置信息（隐藏敏感信息）
+    const safeConfig = {
+      ...session.config,
+      clientId: "***" + session.config.clientId.slice(-4),
+      password: session.config.password ? "***" : "未设置"
+    };
+    
+    return {
+      type: "text",
+      text: `当前配置:\n服务器: ${safeConfig.host}:${safeConfig.port}\n主题: ${safeConfig.topic}\n客户端ID: ${safeConfig.clientId}\n用户名: ${safeConfig.username || "未设置"}\n密码: ${safeConfig.password}`
+    };
   },
   
   sendMessageEvent(sseRes, message) {
@@ -260,7 +331,8 @@ const ResponseHandler = {
         },
         serverInfo: {
           name: "bemfa-mcp",
-          version: "1.0.0"
+          version: "1.0.0",
+          description: "巴法云MQTT智能灯光控制服务 - 需用户自行配置参数"
         }
       }
     };
@@ -274,16 +346,47 @@ const ResponseHandler = {
       result: {
         tools: [
           {
+            name: "configureBemfa",
+            description: "配置巴法云连接参数（必需第一步）",
+            inputSchema: {
+              type: "object",
+              properties: {
+                host: { 
+                  type: "string", 
+                  description: "MQTT服务器地址，默认: bemfa.com",
+                  default: "bemfa.com"
+                },
+                port: { 
+                  type: "number", 
+                  description: "MQTT端口，默认: 9501",
+                  default: 9501
+                },
+                clientId: { 
+                  type: "string", 
+                  description: "巴法云客户端ID（必需）" 
+                },
+                topic: { 
+                  type: "string", 
+                  description: "MQTT主题名称（必需）" 
+                },
+                username: { 
+                  type: "string", 
+                  description: "用户名（可选）" 
+                },
+                password: { 
+                  type: "string", 
+                  description: "密码（可选）" 
+                }
+              },
+              required: ["clientId", "topic"]
+            }
+          },
+          {
             name: "connectBemfa",
             description: "连接到巴法云MQTT服务器",
             inputSchema: {
               type: "object",
-              properties: {
-                host: { type: "string", description: "MQTT服务器地址", default: config.bemfaServer },
-                port: { type: "number", description: "MQTT端口", default: config.bemfaPort },
-                clientId: { type: "string", description: "客户端ID", default: config.defaultClientId },
-                topic: { type: "string", description: "主题名称", default: config.defaultTopic }
-              }
+              properties: {}
             }
           },
           {
@@ -295,7 +398,7 @@ const ResponseHandler = {
                 command: { 
                   type: "string", 
                   enum: ["on", "off", "toggle", "status"],
-                  description: "控制命令" 
+                  description: "控制命令: 开灯(on), 关灯(off), 切换(toggle), 状态查询(status)" 
                 }
               },
               required: ["command"]
@@ -304,6 +407,14 @@ const ResponseHandler = {
           {
             name: "disconnectBemfa",
             description: "断开MQTT连接",
+            inputSchema: {
+              type: "object",
+              properties: {}
+            }
+          },
+          {
+            name: "getConfig",
+            description: "查看当前配置（隐藏敏感信息）",
             inputSchema: {
               type: "object",
               properties: {}
@@ -329,6 +440,20 @@ app.get("/mqttx/sse", (req, res) => {
   // 发送端点信息
   res.write(`event: endpoint\n`);
   res.write(`data: /mqttx/message?sessionId=${sessionId}\n\n`);
+
+  // 发送欢迎消息
+  res.write(`event: message\n`);
+  res.write(`data: ${JSON.stringify({
+    method: "notifications/welcome",
+    params: {
+      message: "欢迎使用巴法云MQTT控制服务！请先调用 configureBemfa 配置您的巴法云参数。",
+      steps: [
+        "1. 调用 configureBemfa 配置客户端ID和主题",
+        "2. 调用 connectBemfa 连接MQTT服务器", 
+        "3. 调用 controlLight 控制灯光设备"
+      ]
+    }
+  })}\n\n`);
 
   // 心跳
   const heartbeat = setInterval(() => {
@@ -398,6 +523,11 @@ async function handleRequest(rpc, session) {
         let result;
         
         switch (toolName) {
+          case "configureBemfa":
+            result = await MQTTHandler.configure(session, args);
+            ResponseHandler.sendResult(session.sseRes, id, { content: [result] });
+            break;
+            
           case "connectBemfa":
             result = await MQTTHandler.connect(session, args);
             ResponseHandler.sendResult(session.sseRes, id, { content: [result] });
@@ -410,6 +540,11 @@ async function handleRequest(rpc, session) {
             
           case "disconnectBemfa":
             result = await MQTTHandler.disconnect(session);
+            ResponseHandler.sendResult(session.sseRes, id, { content: [result] });
+            break;
+            
+          case "getConfig":
+            result = await MQTTHandler.getConfig(session);
             ResponseHandler.sendResult(session.sseRes, id, { content: [result] });
             break;
             
@@ -432,7 +567,8 @@ app.get("/health", (req, res) => {
     status: "healthy", 
     timestamp: new Date().toISOString(),
     sessions: SessionManager.sessions.size,
-    version: "1.0.0"
+    version: "1.0.0",
+    note: "此服务不包含任何预设的巴法云配置，用户需自行提供参数"
   });
 });
 
@@ -441,7 +577,13 @@ app.get("/", (req, res) => {
   res.json({ 
     name: "Bemfa MCP Server",
     version: "1.0.0",
-    description: "巴法云MQTT智能灯光控制MCP服务器",
+    description: "巴法云MQTT智能灯光控制服务 - 安全版本",
+    note: "⚠️ 此服务不包含任何预设配置，用户必须提供自己的巴法云参数",
+    usage: [
+      "1. 调用 configureBemfa 配置参数",
+      "2. 调用 connectBemfa 连接服务器", 
+      "3. 调用 controlLight 控制设备"
+    ],
     endpoints: {
       sse: "/mqttx/sse",
       message: "/mqttx/message",
@@ -454,8 +596,7 @@ app.get("/", (req, res) => {
 app.listen(port, () => {
   Logger.info("Server", `Bemfa MCP服务器启动成功`, { 
     port: port,
-    bemfaServer: config.bemfaServer,
-    defaultTopic: config.defaultTopic
+    note: "安全版本 - 不包含预设的巴法云配置"
   });
 });
 
