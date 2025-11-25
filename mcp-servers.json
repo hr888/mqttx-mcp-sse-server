@@ -4,14 +4,10 @@
       "command": "node",
       "args": ["server.js"],
       "env": {
-        "BEMFA_SERVER": "bemfa.com",
-        "BEMFA_PORT": "9501",
-        "DEFAULT_CLIENT_ID": "1027eaa277d6457fa609c8286749e828",
-        "DEFAULT_TOPIC": "MasterLight002",
         "SERVER_PORT": "4000",
         "NODE_ENV": "production"
       },
-      "description": "巴法云MQTT智能灯光控制服务",
+      "description": "巴法云MQTT智能灯光控制服务 - 用户需自行配置巴法云参数",
       "version": "1.0.0"
     }
   }
