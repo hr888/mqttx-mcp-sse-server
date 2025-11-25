@@ -12,48 +12,32 @@ const config = {
   serverPort: parseInt(process.env.SERVER_PORT) || 4000
 };
 
-// Custom Logger
+console.log("=== Bemfa MCP Server Starting ===");
+console.log("Config:", {
+  bemfaServer: config.bemfaServer,
+  bemfaPort: config.bemfaPort,
+  defaultTopic: config.defaultTopic,
+  serverPort: config.serverPort
+});
+
+// 简化的Logger
 class Logger {
-  static LEVELS = {
-    DEBUG: { value: 0, label: 'DEBUG', color: '\x1b[36m' },
-    INFO: { value: 1, label: 'INFO', color: '\x1b[32m' },
-    WARN: { value: 2, label: 'WARN', color: '\x1b[33m' },
-    ERROR: { value: 3, label: 'ERROR', color: '\x1b[33m' },
-  };
-  
-  static currentLevel = Logger.LEVELS.INFO;
-  
-  static formatTime() {
-    const now = new Date();
-    return now.toISOString();
-  }
-  
-  static formatMessage(level, context, message, data = null) {
-    const reset = '\x1b[0m';
-    let logMessage = `${level.color}[${level.label}\x1b[0m] [${this.formatTime()}] [${context}] ${message}`;
-    
-    if (data) {
-      if (typeof data === 'object') {
-        try {
-          const safeJson = JSON.stringify(data, null, 2);
-          logMessage += `\n${safeJson}`;
-        } catch (e) {
-          logMessage += ` [Object: Unable to stringify]`;
-        }
-      } else {
-        logMessage += ` ${data}`;
-      }
-    }
-    
-    return logMessage;
-  }
-  
   static info(context, message, data = null) {
-    console.log(this.formatMessage(Logger.LEVELS.INFO, context, message, data));
+    const timestamp = new Date().toISOString();
+    let logMessage = `[INFO] [${timestamp}] [${context}] ${message}`;
+    if (data) {
+      logMessage += ` ${JSON.stringify(data)}`;
+    }
+    console.log(logMessage);
   }
   
   static error(context, message, error = null) {
-    console.error(this.formatMessage(Logger.LEVELS.ERROR, context, message, error));
+    const timestamp = new Date().toISOString();
+    let logMessage = `[ERROR] [${timestamp}] [${context}] ${message}`;
+    if (error) {
+      logMessage += ` ${error.message || error}`;
+    }
+    console.error(logMessage);
   }
 }
 
@@ -76,7 +60,7 @@ const SessionManager = {
       mqttClient: null,
       connected: false
     });
-    Logger.info("SessionManager", `New session created: ${sessionId}`);
+    Logger.info("SessionManager", `New session created`, { sessionId });
     return sessionId;
   },
   
@@ -90,11 +74,11 @@ const SessionManager = {
       session.mqttClient.end();
     }
     this.sessions.delete(sessionId);
-    Logger.info("SessionManager", `Session closed: ${sessionId}`);
+    Logger.info("SessionManager", `Session closed`, { sessionId });
   }
 };
 
-// MQTT Handler - 专门适配巴法云控制灯光
+// MQTT Handler
 const MQTTHandler = {
   async connect(session, args) {
     const sessionId = [...SessionManager.sessions].find(([id, s]) => s === session)?.[0];
@@ -107,18 +91,16 @@ const MQTTHandler = {
     
     Logger.info("MQTT", `Connecting to Bemfa cloud`, { host, port, clientId, topic });
     
-    // Disconnect previous client if exists
+    // 断开之前的连接
     if (session.mqttClient) {
       session.mqttClient.end();
     }
     
-    // Create connection options
     const options = {
       clientId: clientId,
       clean: true
     };
     
-    // Create connection URL
     const url = `mqtt://${host}:${port}`;
     
     try {
@@ -131,21 +113,20 @@ const MQTTHandler = {
           session.connected = true;
           session.currentTopic = topic;
           
-          // Subscribe to the topic
+          // 订阅主题
           client.subscribe(topic, (err) => {
             if (err) {
-              Logger.error("MQTT", `Subscribe error`, { sessionId, error: err.message });
+              Logger.error("MQTT", `Subscribe error`, { error: err.message });
             } else {
-              Logger.info("MQTT", `Subscribed to topic`, { sessionId, topic });
+              Logger.info("MQTT", `Subscribed to topic`, { topic });
             }
           });
           
-          // Handle incoming messages
+          // 处理接收到的消息
           client.on('message', (topic, message) => {
             const payload = message.toString();
             Logger.info("MQTT", `Received message`, { topic, payload });
             
-            // Send notification to client
             this.sendMessageEvent(session.sseRes, {
               method: "notifications/message",
               params: {
@@ -158,7 +139,7 @@ const MQTTHandler = {
           
           resolve({
             type: "text",
-            text: `成功连接到巴法云MQTT服务器，主题: ${topic}`
+            text: `✅ 成功连接到巴法云MQTT服务器，主题: ${topic}`
           });
         });
         
@@ -173,16 +154,15 @@ const MQTTHandler = {
     }
   },
   
-  // 专门针对灯光控制的发布方法
   async controlLight(session, args) {
     if (!session.connected || !session.mqttClient) {
-      throw new Error("未连接到MQTT服务器");
+      throw new Error("❌ 未连接到MQTT服务器，请先调用connectBemfa");
     }
     
     const command = args.command; // on, off, toggle, status
     const topic = session.currentTopic || config.defaultTopic;
     
-    // 映射命令到巴法云支持的格式
+    // 命令映射
     const commandMap = {
       'on': 'on',
       'off': 'off', 
@@ -192,7 +172,7 @@ const MQTTHandler = {
     
     const mqttCommand = commandMap[command];
     if (!mqttCommand) {
-      throw new Error(`不支持的命令: ${command}`);
+      throw new Error(`❌ 不支持的命令: ${command}`);
     }
     
     Logger.info("MQTT", `Sending light control command`, { topic, command: mqttCommand });
@@ -212,7 +192,7 @@ const MQTTHandler = {
           
           resolve({
             type: "text",
-            text: `已发送${actionText}命令`
+            text: `✅ 已发送${actionText}命令到设备`
           });
         }
       });
@@ -221,7 +201,7 @@ const MQTTHandler = {
   
   async disconnect(session) {
     if (!session.connected || !session.mqttClient) {
-      throw new Error("未连接");
+      throw new Error("❌ 未连接");
     }
     
     return new Promise((resolve, reject) => {
@@ -233,7 +213,7 @@ const MQTTHandler = {
           session.mqttClient = null;
           resolve({
             type: "text",
-            text: "已断开MQTT连接"
+            text: "✅ 已断开MQTT连接"
           });
         }
       });
@@ -279,7 +259,7 @@ const ResponseHandler = {
           tools: { listChanged: true }
         },
         serverInfo: {
-          name: "bemfa-light-controller",
+          name: "bemfa-mcp",
           version: "1.0.0"
         }
       }
@@ -287,7 +267,6 @@ const ResponseHandler = {
     MQTTHandler.sendMessageEvent(sseRes, capabilities);
   },
   
-  // 专门为灯光控制优化的工具列表
   sendToolsList(sseRes, id) {
     const toolsList = {
       jsonrpc: "2.0",
@@ -316,7 +295,7 @@ const ResponseHandler = {
                 command: { 
                   type: "string", 
                   enum: ["on", "off", "toggle", "status"],
-                  description: "控制命令: 开灯(on), 关灯(off), 切换(toggle), 状态查询(status)" 
+                  description: "控制命令" 
                 }
               },
               required: ["command"]
@@ -337,10 +316,6 @@ const ResponseHandler = {
   }
 };
 
-/*
- * MCP协议路由
- */
-
 // SSE连接端点
 app.get("/mqttx/sse", (req, res) => {
   Logger.info("HTTP", `New SSE connection established`);
@@ -351,11 +326,11 @@ app.get("/mqttx/sse", (req, res) => {
 
   const sessionId = SessionManager.create(res);
 
-  // Send endpoint information
+  // 发送端点信息
   res.write(`event: endpoint\n`);
   res.write(`data: /mqttx/message?sessionId=${sessionId}\n\n`);
 
-  // 发送心跳
+  // 心跳
   const heartbeat = setInterval(() => {
     res.write(`event: heartbeat\ndata: ${Date.now()}\n\n`);
   }, 30000);
@@ -371,7 +346,11 @@ app.post("/mqttx/message", async (req, res) => {
   const sessionId = req.query.sessionId;
   const rpc = req.body;
   
-  Logger.info("HTTP", `Received ${rpc?.method} request`, { sessionId });
+  Logger.info("HTTP", `Received request`, { 
+    sessionId, 
+    method: rpc?.method,
+    id: rpc?.id 
+  });
 
   if (!sessionId) {
     return res.status(400).json({ error: "Missing sessionId" });
@@ -435,7 +414,7 @@ async function handleRequest(rpc, session) {
             break;
             
           default:
-            ResponseHandler.sendError(session.sseRes, id, -32601, `未知工具: ${toolName}`);
+            ResponseHandler.sendError(session.sseRes, id, -32601, `Unknown tool: ${toolName}`);
         }
       } catch (error) {
         ResponseHandler.sendError(session.sseRes, id, -32000, error.message);
@@ -443,27 +422,41 @@ async function handleRequest(rpc, session) {
       break;
       
     default:
-      ResponseHandler.sendError(session.sseRes, id, -32601, `未知方法: ${method}`);
+      ResponseHandler.sendError(session.sseRes, id, -32601, `Unknown method: ${method}`);
   }
 }
 
-// 健康检查端点（魔搭平台需要）
+// 健康检查端点
 app.get("/health", (req, res) => {
   res.json({ 
     status: "healthy", 
     timestamp: new Date().toISOString(),
-    sessions: SessionManager.sessions.size
+    sessions: SessionManager.sessions.size,
+    version: "1.0.0"
+  });
+});
+
+// 根路径
+app.get("/", (req, res) => {
+  res.json({ 
+    name: "Bemfa MCP Server",
+    version: "1.0.0",
+    description: "巴法云MQTT智能灯光控制MCP服务器",
+    endpoints: {
+      sse: "/mqttx/sse",
+      message: "/mqttx/message",
+      health: "/health"
+    }
   });
 });
 
 // 启动服务器
 app.listen(port, () => {
-  Logger.info("Server", `Bemfa MCP服务器已启动`, { 
+  Logger.info("Server", `Bemfa MCP服务器启动成功`, { 
     port: port,
     bemfaServer: config.bemfaServer,
     defaultTopic: config.defaultTopic
   });
 });
 
-// 导出供测试使用
 module.exports = app;
