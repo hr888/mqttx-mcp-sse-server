@@ -3,13 +3,22 @@ const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
 const mqtt = require("mqtt");
 
+// 配置从环境变量读取
+const config = {
+  bemfaServer: process.env.BEMFA_SERVER || "bemfa.com",
+  bemfaPort: parseInt(process.env.BEMFA_PORT) || 9501,
+  defaultClientId: process.env.DEFAULT_CLIENT_ID || "1027eaa277d6457fa609c8286749e828",
+  defaultTopic: process.env.DEFAULT_TOPIC || "MasterLight002",
+  serverPort: parseInt(process.env.SERVER_PORT) || 4000
+};
+
 // Custom Logger
 class Logger {
   static LEVELS = {
-    DEBUG: { value: 0, label: 'DEBUG', color: '\x1b[36m' }, // Cyan
-    INFO: { value: 1, label: 'INFO', color: '\x1b[32m' },   // Green
-    WARN: { value: 2, label: 'WARN', color: '\x1b[33m' },   // Yellow
-    ERROR: { value: 3, label: 'ERROR', color: '\x1b[31m' }, // Red
+    DEBUG: { value: 0, label: 'DEBUG', color: '\x1b[36m' },
+    INFO: { value: 1, label: 'INFO', color: '\x1b[32m' },
+    WARN: { value: 2, label: 'WARN', color: '\x1b[33m' },
+    ERROR: { value: 3, label: 'ERROR', color: '\x1b[33m' },
   };
   
   static currentLevel = Logger.LEVELS.INFO;
@@ -21,16 +30,12 @@ class Logger {
   
   static formatMessage(level, context, message, data = null) {
     const reset = '\x1b[0m';
-    let logMessage = `${level.color}[${level.label}]\x1b[0m [${this.formatTime()}] [MQTTX:${context}] ${message}`;
+    let logMessage = `${level.color}[${level.label}\x1b[0m] [${this.formatTime()}] [${context}] ${message}`;
     
     if (data) {
       if (typeof data === 'object') {
         try {
-          // Limit object depth and handle circular references
-          const safeJson = JSON.stringify(data, (key, value) => {
-            if (key === 'mqttClient' || key === 'sseRes') return '[Object]';
-            return value;
-          }, 2);
+          const safeJson = JSON.stringify(data, null, 2);
           logMessage += `\n${safeJson}`;
         } catch (e) {
           logMessage += ` [Object: Unable to stringify]`;
@@ -43,38 +48,18 @@ class Logger {
     return logMessage;
   }
   
-  static debug(context, message, data = null) {
-    if (Logger.currentLevel.value <= Logger.LEVELS.DEBUG.value) {
-      console.log(this.formatMessage(Logger.LEVELS.DEBUG, context, message, data));
-    }
-  }
-  
   static info(context, message, data = null) {
-    if (Logger.currentLevel.value <= Logger.LEVELS.INFO.value) {
-      console.log(this.formatMessage(Logger.LEVELS.INFO, context, message, data));
-    }
-  }
-  
-  static warn(context, message, data = null) {
-    if (Logger.currentLevel.value <= Logger.LEVELS.WARN.value) {
-      console.warn(this.formatMessage(Logger.LEVELS.WARN, context, message, data));
-    }
+    console.log(this.formatMessage(Logger.LEVELS.INFO, context, message, data));
   }
   
   static error(context, message, error = null) {
-    if (Logger.currentLevel.value <= Logger.LEVELS.ERROR.value) {
-      if (error instanceof Error) {
-        console.error(this.formatMessage(Logger.LEVELS.ERROR, context, message, error.stack));
-      } else {
-        console.error(this.formatMessage(Logger.LEVELS.ERROR, context, message, error));
-      }
-    }
+    console.error(this.formatMessage(Logger.LEVELS.ERROR, context, message, error));
   }
 }
 
 // Initialize Express app
 const app = express();
-const port = 4000;
+const port = config.serverPort;
 
 // Enable CORS and JSON parsing
 app.use(cors());
@@ -88,8 +73,8 @@ const SessionManager = {
     const sessionId = uuidv4();
     this.sessions.set(sessionId, { 
       sseRes: res, 
-      initialized: false,
-      mqttClient: null
+      mqttClient: null,
+      connected: false
     });
     Logger.info("SessionManager", `New session created: ${sessionId}`);
     return sessionId;
@@ -102,174 +87,132 @@ const SessionManager = {
   remove(sessionId) {
     const session = this.sessions.get(sessionId);
     if (session && session.mqttClient) {
-      Logger.debug("SessionManager", `Cleaning up MQTT client for session ${sessionId}`);
       session.mqttClient.end();
     }
     this.sessions.delete(sessionId);
     Logger.info("SessionManager", `Session closed: ${sessionId}`);
-  },
-  
-  stats() {
-    return {
-      activeSessions: this.sessions.size,
-      sessionsWithMqttConnections: [...this.sessions.values()].filter(s => s.mqttClient).length
-    };
   }
 };
 
-// MQTT Handler
+// MQTT Handler - 专门适配巴法云控制灯光
 const MQTTHandler = {
   async connect(session, args) {
     const sessionId = [...SessionManager.sessions].find(([id, s]) => s === session)?.[0];
-    Logger.info("MQTT", `Connecting to broker`, { sessionId, host: args.host, port: args.port, clientId: args.clientId });
+    
+    // 使用配置的默认值或传入参数
+    const host = args.host || config.bemfaServer;
+    const port = args.port || config.bemfaPort;
+    const clientId = args.clientId || config.defaultClientId;
+    const topic = args.topic || config.defaultTopic;
+    
+    Logger.info("MQTT", `Connecting to Bemfa cloud`, { host, port, clientId, topic });
     
     // Disconnect previous client if exists
     if (session.mqttClient) {
-      Logger.debug("MQTT", `Disconnecting previous client`, { sessionId });
       session.mqttClient.end();
     }
     
     // Create connection options
     const options = {
-      clientId: args.clientId,
+      clientId: clientId,
       clean: true
     };
     
-    if (args.username) options.username = args.username;
-    if (args.password) options.password = args.password;
-    
     // Create connection URL
-    const protocol = args.port === 8883 ? 'mqtts' : 'mqtt';
-    const url = `${protocol}://${args.host}:${args.port}`;
+    const url = `mqtt://${host}:${port}`;
     
     try {
-      // Connect to broker
-      Logger.debug("MQTT", `Attempting connection to ${url}`, { sessionId, options: { ...options, password: options.password ? '****' : undefined } });
       const client = mqtt.connect(url, options);
       
-      // Return a promise that resolves when connected or rejects on error
       return new Promise((resolve, reject) => {
         client.once('connect', () => {
-          Logger.info("MQTT", `Connected to ${url}`, { sessionId, clientId: args.clientId });
+          Logger.info("MQTT", `Connected to Bemfa cloud`, { sessionId });
           session.mqttClient = client;
+          session.connected = true;
+          session.currentTopic = topic;
           
-          // Log all client events for debugging
-          client.on('reconnect', () => {
-            Logger.debug("MQTT", `Reconnecting to broker`, { sessionId });
-          });
-          
-          client.on('close', () => {
-            Logger.debug("MQTT", `Connection closed`, { sessionId });
-          });
-          
-          client.on('error', (err) => {
-            Logger.error("MQTT", `Client error`, { sessionId, error: err.message });
-          });
-          
-          client.on('disconnect', () => {
-            Logger.debug("MQTT", `Received disconnect packet`, { sessionId });
+          // Subscribe to the topic
+          client.subscribe(topic, (err) => {
+            if (err) {
+              Logger.error("MQTT", `Subscribe error`, { sessionId, error: err.message });
+            } else {
+              Logger.info("MQTT", `Subscribed to topic`, { sessionId, topic });
+            }
           });
           
           // Handle incoming messages
           client.on('message', (topic, message) => {
             const payload = message.toString();
-            Logger.debug("MQTT", `Received message`, { 
-              sessionId, 
-              topic, 
-              payload: payload.length > 200 ? payload.substring(0, 200) + '...' : payload,
-              length: payload.length
-            });
+            Logger.info("MQTT", `Received message`, { topic, payload });
             
-            // Forward to client via SSE
+            // Send notification to client
             this.sendMessageEvent(session.sseRes, {
               method: "notifications/message",
               params: {
                 topic: topic,
-                payload: payload
+                payload: payload,
+                timestamp: new Date().toISOString()
               }
             });
           });
           
           resolve({
             type: "text",
-            text: `Successfully connected to MQTT broker at ${args.host}:${args.port} with client ID ${args.clientId}`
+            text: `成功连接到巴法云MQTT服务器，主题: ${topic}`
           });
         });
         
         client.once('error', (err) => {
-          Logger.error("MQTT", `Connection error`, { sessionId, error: err.message });
+          Logger.error("MQTT", `Connection error`, { error: err.message });
           reject(err);
         });
       });
     } catch (error) {
-      Logger.error("MQTT", `Connection error`, { sessionId, error: error.message });
+      Logger.error("MQTT", `Connection failed`, { error: error.message });
       throw error;
     }
   },
   
-  async subscribe(session, args) {
-    const sessionId = [...SessionManager.sessions].find(([id, s]) => s === session)?.[0];
-    
-    if (!session.mqttClient) {
-      Logger.error("MQTT", `Subscribe failed: Not connected`, { sessionId });
-      throw new Error("Not connected to an MQTT broker");
+  // 专门针对灯光控制的发布方法
+  async controlLight(session, args) {
+    if (!session.connected || !session.mqttClient) {
+      throw new Error("未连接到MQTT服务器");
     }
     
-    const qos = args.qos || 0;
-    Logger.info("MQTT", `Subscribing to topic`, { sessionId, topic: args.topic, qos });
+    const command = args.command; // on, off, toggle, status
+    const topic = session.currentTopic || config.defaultTopic;
     
-    return new Promise((resolve, reject) => {
-      session.mqttClient.subscribe(args.topic, { qos }, (err, granted) => {
-        if (err) {
-          Logger.error("MQTT", `Subscription error`, { sessionId, topic: args.topic, error: err.message });
-          reject(err);
-        } else {
-          Logger.info("MQTT", `Subscribed to topic`, { 
-            sessionId, 
-            topic: args.topic, 
-            qos,
-            granted: granted
-          });
-          resolve({
-            type: "text",
-            text: `Successfully subscribed to MQTT topic '${args.topic}' with QoS ${qos}`
-          });
-        }
-      });
-    });
-  },
-  
-  async publish(session, args) {
-    const sessionId = [...SessionManager.sessions].find(([id, s]) => s === session)?.[0];
+    // 映射命令到巴法云支持的格式
+    const commandMap = {
+      'on': 'on',
+      'off': 'off', 
+      'toggle': 'toggle',
+      'status': 'status'
+    };
     
-    if (!session.mqttClient) {
-      Logger.error("MQTT", `Publish failed: Not connected`, { sessionId });
-      throw new Error("Not connected to an MQTT broker");
+    const mqttCommand = commandMap[command];
+    if (!mqttCommand) {
+      throw new Error(`不支持的命令: ${command}`);
     }
     
-    const qos = args.qos || 0;
-    const retain = args.retain || false;
-    const payload = args.payload;
-    
-    Logger.info("MQTT", `Publishing message`, { 
-      sessionId, 
-      topic: args.topic, 
-      payload: payload.length > 200 ? payload.substring(0, 200) + '...' : payload,
-      length: payload.length,
-      qos, 
-      retain 
-    });
+    Logger.info("MQTT", `Sending light control command`, { topic, command: mqttCommand });
     
     return new Promise((resolve, reject) => {
-      session.mqttClient.publish(args.topic, payload, { qos, retain }, (err) => {
+      session.mqttClient.publish(topic, mqttCommand, (err) => {
         if (err) {
-          Logger.error("MQTT", `Publish error`, { sessionId, topic: args.topic, error: err.message });
+          Logger.error("MQTT", `Publish error`, { error: err.message });
           reject(err);
         } else {
-          Logger.debug("MQTT", `Published message successfully`, { sessionId, topic: args.topic });
+          const actionText = {
+            'on': '开灯',
+            'off': '关灯', 
+            'toggle': '切换灯光',
+            'status': '查询状态'
+          }[command];
+          
           resolve({
             type: "text",
-            text: `Successfully published message to MQTT topic '${args.topic}' with QoS ${qos}, retain: ${retain}`
+            text: `已发送${actionText}命令`
           });
         }
       });
@@ -277,55 +220,38 @@ const MQTTHandler = {
   },
   
   async disconnect(session) {
-    const sessionId = [...SessionManager.sessions].find(([id, s]) => s === session)?.[0];
-    
-    if (!session.mqttClient) {
-      Logger.warn("MQTT", `Disconnect called but not connected`, { sessionId });
-      throw new Error("Not connected to an MQTT broker");
+    if (!session.connected || !session.mqttClient) {
+      throw new Error("未连接");
     }
-    
-    Logger.info("MQTT", `Disconnecting from broker`, { sessionId });
     
     return new Promise((resolve, reject) => {
       session.mqttClient.end(false, {}, (err) => {
         if (err) {
-          Logger.error("MQTT", `Disconnect error`, { sessionId, error: err.message });
           reject(err);
         } else {
-          Logger.info("MQTT", `Disconnected from MQTT broker`, { sessionId });
+          session.connected = false;
           session.mqttClient = null;
           resolve({
             type: "text",
-            text: "Successfully disconnected from MQTT broker"
+            text: "已断开MQTT连接"
           });
         }
       });
     });
   },
   
-  // Helper for sending events via SSE
   sendMessageEvent(sseRes, message) {
     if (!sseRes) return;
     
-    const jsonMessage = typeof message === 'string' 
-      ? message 
-      : JSON.stringify(message);
-      
+    const jsonMessage = JSON.stringify(message);
     sseRes.write(`event: message\n`);
     sseRes.write(`data: ${jsonMessage}\n\n`);
-    
-    Logger.debug("SSE", `Sent message event`, { 
-      messageType: message.method || 'unknown',
-      messageLength: jsonMessage.length
-    });
   }
 };
 
 // Response Handler
 const ResponseHandler = {
-  // Send JSON-RPC error response
   sendError(sseRes, id, code, message) {
-    Logger.warn("RPC", `Sending error response`, { id, code, message });
     const errorRes = {
       jsonrpc: "2.0",
       id: id,
@@ -334,9 +260,7 @@ const ResponseHandler = {
     MQTTHandler.sendMessageEvent(sseRes, errorRes);
   },
   
-  // Send JSON-RPC success response
   sendResult(sseRes, id, result) {
-    Logger.debug("RPC", `Sending success response`, { id });
     const successRes = {
       jsonrpc: "2.0",
       id: id,
@@ -345,22 +269,17 @@ const ResponseHandler = {
     MQTTHandler.sendMessageEvent(sseRes, successRes);
   },
   
-  // Send capabilities response
   sendCapabilities(sseRes, id) {
-    Logger.debug("RPC", `Sending capabilities response`, { id });
     const capabilities = {
       jsonrpc: "2.0",
       id: id,
       result: {
         protocolVersion: "2024-11-05",
         capabilities: {
-          tools: { listChanged: true },
-          resources: { subscribe: true, listChanged: true },
-          prompts: { listChanged: true },
-          logging: {}
+          tools: { listChanged: true }
         },
         serverInfo: {
-          name: "mqtt-server",
+          name: "bemfa-light-controller",
           version: "1.0.0"
         }
       }
@@ -368,65 +287,50 @@ const ResponseHandler = {
     MQTTHandler.sendMessageEvent(sseRes, capabilities);
   },
   
-  // Send list of available tools
+  // 专门为灯光控制优化的工具列表
   sendToolsList(sseRes, id) {
-    Logger.debug("RPC", `Sending tools list response`, { id });
     const toolsList = {
       jsonrpc: "2.0",
       id: id,
       result: {
         tools: [
           {
-            name: "mqttConnect",
-            description: "Connects to an MQTT broker with the specified parameters.",
+            name: "connectBemfa",
+            description: "连接到巴法云MQTT服务器",
             inputSchema: {
               type: "object",
               properties: {
-                host: { type: "string", description: "MQTT broker host" },
-                port: { type: "number", description: "MQTT broker port" },
-                clientId: { type: "string", description: "Client identifier" },
-                username: { type: "string", description: "Authentication username (optional)" },
-                password: { type: "string", description: "Authentication password (optional)" }
-              },
-              required: ["host", "port", "clientId"]
+                host: { type: "string", description: "MQTT服务器地址", default: config.bemfaServer },
+                port: { type: "number", description: "MQTT端口", default: config.bemfaPort },
+                clientId: { type: "string", description: "客户端ID", default: config.defaultClientId },
+                topic: { type: "string", description: "主题名称", default: config.defaultTopic }
+              }
             }
           },
           {
-            name: "mqttSubscribe",
-            description: "Subscribes to the specified MQTT topic.",
+            name: "controlLight",
+            description: "控制智能灯光",
             inputSchema: {
               type: "object",
               properties: {
-                topic: { type: "string", description: "MQTT topic to subscribe to" },
-                qos: { type: "number", description: "Quality of Service (0, 1, or 2)" }
+                command: { 
+                  type: "string", 
+                  enum: ["on", "off", "toggle", "status"],
+                  description: "控制命令: 开灯(on), 关灯(off), 切换(toggle), 状态查询(status)" 
+                }
               },
-              required: ["topic"]
+              required: ["command"]
             }
           },
           {
-            name: "mqttPublish",
-            description: "Publishes a message to the specified MQTT topic.",
-            inputSchema: {
-              type: "object",
-              properties: {
-                topic: { type: "string", description: "MQTT topic to publish to" },
-                payload: { type: "string", description: "Message payload" },
-                qos: { type: "number", description: "Quality of Service (0, 1, or 2)" },
-                retain: { type: "boolean", description: "Whether to retain the message" }
-              },
-              required: ["topic", "payload"]
-            }
-          },
-          {
-            name: "mqttDisconnect",
-            description: "Disconnects from the currently connected MQTT broker.",
+            name: "disconnectBemfa",
+            description: "断开MQTT连接",
             inputSchema: {
               type: "object",
               properties: {}
             }
           }
-        ],
-        count: 4
+        ]
       }
     };
     MQTTHandler.sendMessageEvent(sseRes, toolsList);
@@ -434,197 +338,132 @@ const ResponseHandler = {
 };
 
 /*
- * Route 1: SSE Connection
- * Establishes Server-Sent Events connection with the client
+ * MCP协议路由
  */
-app.get("/mqttx/sse", (req, res) => {
-  const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  Logger.info("HTTP", `New SSE connection established`, { clientIp });
 
-  // Set SSE headers
+// SSE连接端点
+app.get("/mqttx/sse", (req, res) => {
+  Logger.info("HTTP", `New SSE connection established`);
+
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
 
-  // Create a new session
   const sessionId = SessionManager.create(res);
 
-  // Send endpoint information to client
+  // Send endpoint information
   res.write(`event: endpoint\n`);
   res.write(`data: /mqttx/message?sessionId=${sessionId}\n\n`);
-  Logger.debug("SSE", `Sent endpoint info to client`, { sessionId });
 
-  // Log session stats 
-  Logger.info("Server", `Session stats`, SessionManager.stats());
-
-  // Send heartbeat every 10 seconds
+  // 发送心跳
   const heartbeat = setInterval(() => {
-    const timestamp = Date.now();
-    res.write(`event: heartbeat\ndata: ${timestamp}\n\n`);
-    Logger.debug("SSE", `Sent heartbeat`, { sessionId, timestamp });
-  }, 10000);
+    res.write(`event: heartbeat\ndata: ${Date.now()}\n\n`);
+  }, 30000);
 
-  // Cleanup on disconnect
   req.on("close", () => {
     clearInterval(heartbeat);
-    Logger.info("HTTP", `SSE connection closed`, { sessionId });
     SessionManager.remove(sessionId);
-    Logger.info("Server", `Session stats after disconnect`, SessionManager.stats());
   });
 });
 
-/*
- * Route 2: Message Handler
- * Handles JSON-RPC requests from client
- */
+// MCP消息处理端点
 app.post("/mqttx/message", async (req, res) => {
   const sessionId = req.query.sessionId;
   const rpc = req.body;
-  const method = rpc?.method || "unknown";
-  const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   
-  Logger.info("HTTP", `Received ${method} request`, { sessionId, clientIp, requestId: rpc?.id });
+  Logger.info("HTTP", `Received ${rpc?.method} request`, { sessionId });
 
-  // Validate session
   if (!sessionId) {
-    Logger.error("HTTP", `Missing sessionId in request`, { clientIp });
-    return res.status(400).json({ error: "Missing sessionId in query parameters" });
+    return res.status(400).json({ error: "Missing sessionId" });
   }
   
   const session = SessionManager.get(sessionId);
   if (!session) {
-    Logger.error("HTTP", `Invalid sessionId, no active session found`, { sessionId, clientIp });
-    return res.status(404).json({ error: "No active session with that sessionId" });
+    return res.status(404).json({ error: "Invalid session" });
   }
 
-  // Validate JSON-RPC format
-  if (!rpc || rpc.jsonrpc !== "2.0" || !rpc.method) {
-    Logger.error("RPC", `Invalid JSON-RPC request`, { sessionId, request: JSON.stringify(rpc) });
-    return res.json({
-      jsonrpc: "2.0",
-      id: rpc?.id ?? null,
-      error: {
-        code: -32600,
-        message: "Invalid JSON-RPC request"
-      }
-    });
-  }
-
-  // Log received parameters if debug level
-  Logger.debug("RPC", `Request parameters`, { 
-    sessionId, 
-    method: rpc.method,
-    params: rpc.params 
-  });
-
-  // Send minimal HTTP acknowledgment
+  // 立即返回ACK
   res.json({
     jsonrpc: "2.0",
     id: rpc.id,
-    result: { ack: `Received ${rpc.method}` }
+    result: { ack: true }
   });
-  Logger.debug("HTTP", `Sent acknowledgment response`, { sessionId, requestId: rpc.id });
 
-  // Process the request
+  // 异步处理请求
   try {
-    const startTime = Date.now();
     await handleRequest(rpc, session);
-    const processingTime = Date.now() - startTime;
-    Logger.debug("RPC", `Request processing completed`, { 
-      sessionId, 
-      method: rpc.method, 
-      requestId: rpc.id,
-      processingTime: `${processingTime}ms` 
-    });
   } catch (error) {
-    Logger.error("RPC", `Error handling request`, { 
-      sessionId, 
-      method: rpc.method,
-      requestId: rpc.id,
-      error: error.message,
-      stack: error.stack
-    });
+    Logger.error("RPC", `Error handling request`, { error: error.message });
     ResponseHandler.sendError(session.sseRes, rpc.id, -32000, error.message);
   }
 });
 
-// Request handler function
+// 请求处理器
 async function handleRequest(rpc, session) {
-  const { method, id } = rpc;
-  const sseRes = session.sseRes;
-  const sessionId = [...SessionManager.sessions].find(([id, s]) => s === session)?.[0];
+  const { method, id, params } = rpc;
   
   switch (method) {
     case "initialize":
-      session.initialized = true;
-      Logger.info("RPC", `Initializing session`, { sessionId, requestId: id });
-      ResponseHandler.sendCapabilities(sseRes, id);
+      ResponseHandler.sendCapabilities(session.sseRes, id);
       break;
       
     case "tools/list":
-      Logger.info("RPC", `Listing MQTT tools`, { sessionId, requestId: id });
-      ResponseHandler.sendToolsList(sseRes, id);
+      ResponseHandler.sendToolsList(session.sseRes, id);
       break;
       
     case "tools/call":
-      const toolName = rpc.params?.name;
-      const args = rpc.params?.arguments || {};
-      Logger.info("RPC", `Tool call`, { sessionId, requestId: id, tool: toolName });
+      const toolName = params?.name;
+      const args = params?.arguments || {};
       
       try {
         let result;
         
-        // Process tool calls
         switch (toolName) {
-          case "mqttConnect":
+          case "connectBemfa":
             result = await MQTTHandler.connect(session, args);
-            ResponseHandler.sendResult(sseRes, id, { content: [result] });
+            ResponseHandler.sendResult(session.sseRes, id, { content: [result] });
             break;
             
-          case "mqttSubscribe":
-            result = await MQTTHandler.subscribe(session, args);
-            ResponseHandler.sendResult(sseRes, id, { content: [result] });
+          case "controlLight":
+            result = await MQTTHandler.controlLight(session, args);
+            ResponseHandler.sendResult(session.sseRes, id, { content: [result] });
             break;
             
-          case "mqttPublish":
-            result = await MQTTHandler.publish(session, args);
-            ResponseHandler.sendResult(sseRes, id, { content: [result] });
-            break;
-            
-          case "mqttDisconnect":
+          case "disconnectBemfa":
             result = await MQTTHandler.disconnect(session);
-            ResponseHandler.sendResult(sseRes, id, { content: [result] });
+            ResponseHandler.sendResult(session.sseRes, id, { content: [result] });
             break;
             
           default:
-            Logger.warn("RPC", `Unknown tool requested`, { sessionId, requestId: id, tool: toolName });
-            ResponseHandler.sendError(sseRes, id, -32601, `No such tool '${toolName}'`);
+            ResponseHandler.sendError(session.sseRes, id, -32601, `未知工具: ${toolName}`);
         }
       } catch (error) {
-        Logger.error("RPC", `Tool error`, { sessionId, requestId: id, tool: toolName, error: error.message });
-        ResponseHandler.sendError(sseRes, id, -32000, `MQTT operation error: ${error.message}`);
+        ResponseHandler.sendError(session.sseRes, id, -32000, error.message);
       }
       break;
       
-    case "notifications/initialized":
-      Logger.info("RPC", `Client initialized notification received`, { sessionId });
-      // No response needed
-      break;
-      
     default:
-      Logger.warn("RPC", `Unknown method called`, { sessionId, requestId: id, method });
-      ResponseHandler.sendError(sseRes, id, -32601, `Method '${method}' not recognized`);
+      ResponseHandler.sendError(session.sseRes, id, -32601, `未知方法: ${method}`);
   }
 }
 
-// Start the server
-app.listen(port, () => {
-  Logger.info("Server", `Server started successfully on port ${port}`, { 
-    endpoints: [
-      `GET  /mqttx/sse - establishes SSE connection`,
-      `POST /mqttx/message?sessionId=xxx - handles MQTT commands`
-    ],
-    version: "1.0.0",
-    node: process.version
+// 健康检查端点（魔搭平台需要）
+app.get("/health", (req, res) => {
+  res.json({ 
+    status: "healthy", 
+    timestamp: new Date().toISOString(),
+    sessions: SessionManager.sessions.size
   });
 });
+
+// 启动服务器
+app.listen(port, () => {
+  Logger.info("Server", `Bemfa MCP服务器已启动`, { 
+    port: port,
+    bemfaServer: config.bemfaServer,
+    defaultTopic: config.defaultTopic
+  });
+});
+
+// 导出供测试使用
+module.exports = app;
